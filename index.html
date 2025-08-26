@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>تحلیل فاندامنتال لحظه‌ای — شاخص دلار و EUR/USD</title>
+  <style>
+    body{font-family:Tahoma,Arial,sans-serif;background:#0b1220;color:#e6eef8;margin:0;padding:24px}
+    .wrap{max-width:980px;margin:0 auto}
+    h1{margin:0 0 8px 0}
+    .muted{opacity:.8;font-size:13px}
+    .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-top:12px}
+    .card{background:#0f172a;border:1px solid #1e293b;border-radius:12px;padding:14px}
+    button{padding:10px 14px;border:none;border-radius:10px;background:#2563eb;color:#fff;cursor:pointer}
+    .kpi{font-size:28px;font-weight:bold}
+    .good{color:#22c55e}.bad{color:#ef4444}.neutral{color:#eab308}
+    pre{background:#071429;border-radius:10px;padding:12px;overflow:auto}
+    a{color:#93c5fd}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>تحلیل لحظه‌ای شاخص دلار (DXY) و EUR/USD</h1>
+  <div class="muted">منبع نرخ‌ها: <code>exchangerate.host</code> (بدون نیاز به API Key). محاسبهٔ DXY با فرمول استاندارد سبد ۶‌ارزی.</div>
+
+  <div style="margin:14px 0">
+    <button id="btn">دریافت و تحلیل زنده</button>
+    <span id="status" style="margin-right:10px"></span>
+  </div>
+
+  <div class="cards">
+    <div class="card">
+      <div>شاخص دلار DXY</div>
+      <div id="dxyVal" class="kpi">—</div>
+      <div id="dxyChg">—</div>
+    </div>
+    <div class="card">
+      <div>EUR/USD</div>
+      <div id="eurVal" class="kpi">—</div>
+      <div id="eurChg">—</div>
+    </div>
+    <div class="card">
+      <div>نتیجه‌گیری امروز</div>
+      <div id="summary" style="margin-top:6px">—</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <div><b>دلایل و توضیحات فاندامنتال (بر پایه تغییرات امروز نسبت به روز کاری قبل):</b></div>
+    <ul id="reasons" style="margin-top:6px"></ul>
+  </div>
+
+  <details class="card" style="margin-top:12px">
+    <summary>جزئیات محاسبه و داده‌های خام</summary>
+    <pre id="raw">—</pre>
+  </details>
+
+  <div class="muted" style="margin-top:12px">نکته: اگر آخر هفته/تعطیلات باشد، “روز قبل” بر اساس آخرین روز کاری موجود انتخاب می‌شود.</div>
+</div>
+
+<script>
+// ---------- Utilities ----------
+const pow = Math.pow;
+const round = (x, n=4) => (typeof x === 'number' && isFinite(x)) ? x.toFixed(n) : '—';
+const pct = (a,b) => (typeof a==='number'&&typeof b==='number'&&isFinite(a)&&isFinite(b)&&b!==0) ? ((a-b)/b*100) : null;
+
+function computeDXY({EURUSD, USDJPY, GBPUSD, USDCAD, USDSEK, USDCHF}){
+  // ICE formula weights (approx): EUR 57.6%, JPY 13.6%, GBP 11.9%, CAD 9.1%, SEK 4.2%, CHF 3.6%
+  // DXY = 50.14348112 * (EURUSD^-0.576) * (USDJPY^0.136) * (GBPUSD^-0.119) * (USDCAD^0.091) * (USDSEK^0.042) * (USDCHF^0.036)
+  const base = 50.14348112;
+  return base
+    * pow(EURUSD, -0.576)
+    * pow(USDJPY, 0.136)
+    * pow(GBPUSD, -0.119)
+    * pow(USDCAD, 0.091)
+    * pow(USDSEK, 0.042)
+    * pow(USDCHF, 0.036);
+}
+
+async function fetchTimeseries(startISO, endISO){
+  const url = `https://api.exchangerate.host/timeseries?start_date=${startISO}&end_date=${endISO}&base=USD&symbols=EUR,JPY,GBP,CAD,SEK,CHF`;
+  const r = await fetch(url, {cache:'no-store'});
+  if(!r.ok) throw new Error('Data fetch failed: '+r.status);
+  return r.json();
+}
+
+function previousBusinessDate(seriesDates, latestDate){
+  // pick the latest date < latestDate that exists in series (handles weekends/holidays)
+  const arr = seriesDates.filter(d => d < latestDate).sort();
+  return arr.length ? arr[arr.length-1] : null;
+}
+
+function basketBreadth(todayRates, prevRates){
+  // % change of USD vs each currency (base=USD, so higher rate => stronger USD)
+  const keys = ['EUR','JPY','GBP','CAD','SEK','CHF'];
+  const changes = keys.map(k => (todayRates[k] && prevRates[k]) ? ((todayRates[k]-prevRates[k])/prevRates[k]*100) : null);
+  const valid = changes.filter(x => x!==null && isFinite(x));
+  const avg = valid.length ? valid.reduce((a,b)=>a+b,0)/valid.length : null;
+  // breadth: count of pairs where USD strengthened (>0)
+  const upCount = changes.filter(x => typeof x==='number' && x>0).length;
+  return {avg, upCount, total: keys.length, each: Object.fromEntries(keys.map((k,i)=>[k, changes[i]]))};
+}
+
+// ---------- Main flow ----------
+async function run(){
+  const statusEl = document.getElementById('status');
+  const dxyVal = document.getElementById('dxyVal');
+  const dxyChg = document.getElementById('dxyChg');
+  const eurVal = document.getElementById('eurVal');
+  const eurChg = document.getElementById('eurChg');
+  const raw = document.getElementById('raw');
+  const reasons = document.getElementById('reasons');
+  const summary = document.getElementById('summary');
+
+  reasons.innerHTML = '';
+  summary.textContent = '—';
+  statusEl.textContent = 'در حال دریافت...';
+
+  try{
+    const today = new Date();
+    const endISO = today.toISOString().slice(0,10);
+    const start = new Date(+today - 7*24*3600*1000);
+    const startISO = start.toISOString().slice(0,10);
+
+    const js = await fetchTimeseries(startISO, endISO);
+    if(!js || !js.rates) throw new Error('invalid payload');
+
+    // pick latest available date
+    const dates = Object.keys(js.rates).sort();
+    const latestDate = dates[dates.length-1];
+    const prevDate = previousBusinessDate(dates, latestDate);
+    if(!prevDate) throw new Error('prev business date not found');
+
+    const t = js.rates[latestDate]; // base USD
+    const p = js.rates[prevDate];
+
+    // Build pairs for DXY formula (need EURUSD, USDJPY, GBPUSD, USDCAD, USDSEK, USDCHF)
+    const pairsToday = {
+      EURUSD: 1 / t.EUR,
+      USDJPY: t.JPY,
+      GBPUSD: 1 / t.GBP,
+      USDCAD: t.CAD,
+      USDSEK: t.SEK,
+      USDCHF: t.CHF
+    };
+    const pairsPrev = {
+      EURUSD: 1 / p.EUR,
+      USDJPY: p.JPY,
+      GBPUSD: 1 / p.GBP,
+      USDCAD: p.CAD,
+      USDSEK: p.SEK,
+      USDCHF: p.CHF
+    };
+
+    const dxyT = computeDXY(pairsToday);
+    const dxyP = computeDXY(pairsPrev);
+    const dxyPct = pct(dxyT, dxyP);
+
+    const eurusdT = pairsToday.EURUSD;
+    const eurusdP = pairsPrev.EURUSD;
+    const eurPct = pct(eurusdT, eurusdP);
+
+    // breadth of USD vs basket
+    const breadth = basketBreadth(t, p);
+
+    // Simple interpretation logic
+    let dxySignal = 'خنثی', eurSignal = 'خنثی';
+    if(dxyPct !== null){
+      if(dxyPct >= 0.15) dxySignal = 'صعودی (قدرت دلار)';
+      else if(dxyPct <= -0.15) dxySignal = 'نزولی (ضعف دلار)';
+    }
+    if(eurPct !== null){
+      if(eurPct >= 0.20) eurSignal = 'صعودی (یورو قوی)';
+      else if(eurPct <= -0.20) eurSignal = 'نزولی (یورو ضعیف)';
+    }
+
+    // Reasons/narrative
+    const items = [];
+    if(dxyPct !== null) items.push(`DXY نسبت به ${prevDate}: ${dxyPct.toFixed(2)}٪ (${dxySignal.includes('صعودی')?'قدرت':'ضعف'} دلار).`);
+    if(eurPct !== null) items.push(`EUR/USD نسبت به ${prevDate}: ${eurPct.toFixed(2)}٪ (${eurSignal}).`);
+    if(breadth.avg !== null) items.push(`قدرت متوسط دلار در سبد ۶ ارزی: ${breadth.avg.toFixed(2)}٪؛ جهت حرکت در ${breadth.upCount} از ${breadth.total} ارز به نفع دلار است.`);
+
+    // Divergence explanations
+    if(dxyPct>0 && eurPct>0){
+      items.push('واگرایی: همزمانی رشد DXY و EUR/USD نشان می‌دهد یورو در برابر سایر ارزها قوی‌تر از کاهش کلی دلار است (قدرت اختصاصی یورو).');
+    }else if(dxyPct<0 && eurPct<0){
+      items.push('واگرایی: افت DXY با افت EUR/USD یعنی ضعف عمومی دلار کمتر از ضعف خاص یورو است (فشار خاص بر یورو).');
+    }
+
+    // Summary
+    let sumTxt = '';
+    if(dxySignal.includes('قدرت') && !eurSignal.includes('صعودی')) sumTxt = 'بایاس روز: دلار قوی؛ فروش EUR/USD محتاطانه منطقی‌تر است.';
+    else if(dxySignal.includes('ضعف') && !eurSignal.includes('نزولی')) sumTxt = 'بایاس روز: دلار ضعیف؛ خرید EUR/USD محتاطانه منطقی‌تر است.';
+    else sumTxt = 'بایاس روز: ناحیهٔ رنج/مختلط — بهتر است منتظر شکست/داده‌های جدید بمانید.';
+
+    // Render KPIs
+    dxyVal.textContent = round(dxyT, 4);
+    dxyChg.innerHTML = (dxyPct===null?'—': (dxyPct>=0?'<span class="good">+'+dxyPct.toFixed(2)+'%</span>':'<span class="bad">'+dxyPct.toFixed(2)+'%</span>'))
+      + ` از ${prevDate}`;
+    eurVal.textContent = round(eurusdT, 5);
+    eurChg.innerHTML = (eurPct===null?'—': (eurPct>=0?'<span class="good">+'+eurPct.toFixed(2)+'%</span>':'<span class="bad">'+eurPct.toFixed(2)+'%</span>'))
+      + ` از ${prevDate}`;
+
+    summary.textContent = sumTxt;
+    reasons.innerHTML = items.map(x=>`<li>${x}</li>`).join('');
+
+    // RAW
+    const rawObj = {
+      latestDate, prevDate,
+      pairsToday, pairsPrev,
+      dxyToday: dxyT, dxyPrev: dxyP, dxyPct,
+      eurusdToday: eurusdT, eurusdPrev: eurusdP, eurPct,
+      breadth
+    };
+    raw.textContent = JSON.stringify(rawObj, null, 2);
+
+    document.getElementById('status').textContent = 'تمام شد';
+  }catch(err){
+    document.getElementById('status').textContent = 'خطا';
+    document.getElementById('summary').textContent = 'خطا در دریافت داده. اگر فایل را مستقیم با file:// باز کرده‌اید، آن را روی GitHub Pages یا یک سرور محلی ساده اجرا کنید.';
+    document.getElementById('reasons').innerHTML = `<li>${String(err.message||err)}</li>`;
+  }
+}
+
+document.getElementById('btn').addEventListener('click', run);
+</script>
+</body>
+</html>
